@@ -1,8 +1,11 @@
+import fs from "node:fs";
+
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
 const testMode = process.env.TEST_MODE === "true";
+const dryRun = process.env.DRY_RUN === "true";
 const THRESHOLD = 500;
-const HALF_HOUR = 1800e3;
+const STATE_FILE = "state.json";
 
 async function getJson(url) {
   const res = await fetch(url, {
@@ -14,6 +17,10 @@ async function getJson(url) {
 }
 
 async function sendTelegram(text) {
+  if (dryRun) {
+    console.log(`[dry] ${text}`);
+    return;
+  }
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -24,49 +31,51 @@ async function sendTelegram(text) {
   if (!data || !data.ok) throw new Error(`telegram send failed: ${JSON.stringify(data)}`);
 }
 
-function lastTwoClosed(points) {
-  const now = Date.now();
-  const closed = points
-    .map((c) => ({ t: Number(c.t), close: Number(c.close) }))
-    .sort((a, b) => a.t - b.t)
-    .filter((c) => c.t + HALF_HOUR <= now + 60000);
-  if (closed.length < 2) throw new Error("not enough closed candles");
-  return { prev: closed[closed.length - 2], last: closed[closed.length - 1], spanMs: HALF_HOUR };
+async function getSpot() {
+  const sources = [
+    ["Kraken", async () => {
+      const j = await getJson("https://api.kraken.com/0/public/Ticker?pair=XBTUSD");
+      const v = Number((j.result?.XXBTZUSD || j.result?.XBTUSD)?.c?.[0]);
+      if (v > 0) return v;
+      throw new Error("unexpected kraken payload");
+    }],
+    ["Coinbase", async () => {
+      const j = await getJson("https://api.coinbase.com/v2/prices/BTC-USD/spot");
+      const v = Number(j.data?.amount);
+      if (v > 0) return v;
+      throw new Error("unexpected coinbase payload");
+    }],
+    ["CoinGecko", async () => {
+      const j = await getJson("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");
+      const v = Number(j.bitcoin?.usd);
+      if (v > 0) return v;
+      throw new Error("unexpected coingecko payload");
+    }],
+  ];
+  let lastErr = null;
+  for (const [name, load] of sources) {
+    try {
+      return { price: await load(), source: name };
+    } catch (err) {
+      lastErr = err;
+      console.error(`${name} failed: ${err.message}`);
+    }
+  }
+  throw lastErr || new Error("no price source available");
 }
 
-const sources = [
-  {
-    name: "Kraken",
-    async get() {
-      const raw = await getJson("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=30");
-      const rows = raw.result && (raw.result.XXBTZUSD || raw.result.XBTUSD);
-      if (!Array.isArray(rows)) throw new Error("unexpected kraken payload");
-      return lastTwoClosed(rows.map((c) => ({ t: Number(c[0]) * 1000, close: Number(c[4]) })));
-    },
-  },
-  {
-    name: "CoinGecko",
-    async get() {
-      const raw = await getJson("https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=1");
-      if (!Array.isArray(raw)) throw new Error("unexpected coingecko payload");
-      return lastTwoClosed(raw.map((c) => ({ t: Number(c[0]), close: Number(c[4]) })));
-    },
-  },
-  {
-    name: "Coinbase 15m",
-    async get() {
-      const raw = await getJson("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900");
-      if (!Array.isArray(raw)) throw new Error("unexpected coinbase payload");
-      const now = Date.now();
-      const closed = raw
-        .map((c) => ({ t: Number(c[0]) * 1000, close: Number(c[4]) }))
-        .sort((a, b) => a.t - b.t)
-        .filter((c) => c.t + 900e3 <= now + 60000);
-      if (closed.length < 3) throw new Error("not enough closed 15m candles");
-      return { prev: closed[closed.length - 3], last: closed[closed.length - 1], spanMs: 900e3 };
-    },
-  },
-];
+function readState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    return { anchor: Number(s.anchor), anchorTime: s.anchorTime || null };
+  } catch {
+    return null;
+  }
+}
+
+function writeState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+}
 
 async function main() {
   if (testMode) {
@@ -75,33 +84,28 @@ async function main() {
     return;
   }
 
-  let picked = null;
-  let lastErr = null;
-  for (const source of sources) {
-    try {
-      const result = await source.get();
-      picked = { ...result, source: source.name };
-      break;
-    } catch (err) {
-      lastErr = err;
-      console.error(`${source.name} failed: ${err.message}`);
-    }
+  const { price, source } = await getSpot();
+  const now = new Date().toISOString();
+  const state = readState();
+
+  if (!state || !(state.anchor > 0)) {
+    writeState({ anchor: price, anchorTime: now });
+    console.log(`baseline saved: anchor $${price} (${source}) at ${now}`);
+    return;
   }
-  if (!picked) throw lastErr || new Error("no data source available");
 
-  const delta = picked.last.close - picked.prev.close;
-  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
-  const p = picked.prev.close.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  const l = picked.last.close.toLocaleString("en-US", { maximumFractionDigits: 2 });
-
+  const delta = price - state.anchor;
   if (Math.abs(delta) >= THRESHOLD) {
     const dir = delta > 0 ? "up" : "down";
+    const anchorS = state.anchor.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    const priceS = price.toLocaleString("en-US", { maximumFractionDigits: 2 });
     await sendTelegram(
-      `BTC ${dir} $${Math.abs(delta).toFixed(0)} in 30 min: $${p} -> $${l} (${picked.source} BTC/USD, window ending ${hhmm(picked.last.t + picked.spanMs)} UTC).`
+      `BTC ${dir} $${Math.abs(delta).toFixed(0)} from the last alert price: $${anchorS} -> $${priceS} (${source} BTC/USD, ${now}).`
     );
-    console.log(`ALERT ${dir} $${delta.toFixed(2)} (${picked.prev.close} -> ${picked.last.close}, ${picked.source})`);
+    writeState({ anchor: price, anchorTime: now });
+    console.log(`ALERT ${dir} $${delta.toFixed(2)} (anchor ${state.anchor} -> ${price}, ${source})`);
   } else {
-    console.log(`ok: 30m move $${delta.toFixed(2)} (${picked.prev.close} -> ${picked.last.close}, ${picked.source})`);
+    console.log(`ok: $${price} vs anchor $${state.anchor} (delta ${delta.toFixed(2)}, ${source})`);
   }
 }
 

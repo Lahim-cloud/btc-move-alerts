@@ -26,12 +26,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Check BTC 30m move
+      - name: Check BTC vs last alert price
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_MODE: ${{ inputs.test }}
         run: node check.mjs
+      - name: Persist anchor (baseline or alert)
+        run: |
+          if [ -f state.json ]; then
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git config user.name "btc-alerts-bot"
+              git config user.email "btc-alerts-bot@users.noreply.github.com"
+              git commit -m "anchor $(date -u +%FT%TZ)"
+              git push
+            fi
+          fi
       - name: Daily heartbeat (keeps the schedule enabled)
         if: github.event_name == 'schedule'
         run: |
