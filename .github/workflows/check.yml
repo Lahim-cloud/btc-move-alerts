@@ -2,7 +2,7 @@ name: BTC move alerts
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "21,51 * * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -40,7 +40,7 @@ jobs:
               git config user.name "btc-alerts-bot"
               git config user.email "btc-alerts-bot@users.noreply.github.com"
               git commit -m "state $(date -u +%FT%TZ)"
-              git push
+              git push || true
             fi
           fi
       - name: Daily heartbeat (keeps the schedule enabled)
