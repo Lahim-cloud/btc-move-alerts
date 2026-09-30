@@ -9,9 +9,13 @@ on:
         description: "Send a test Telegram message instead of checking"
         type: boolean
         default: false
+      sleep_seconds:
+        description: "Seconds to wait before scheduling the next run (testing only; leave default in normal use)"
+        default: "600"
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: btc-alerts
@@ -20,7 +24,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -54,3 +58,23 @@ jobs:
             git commit -m "heartbeat $(date -u +%F)" || true
             git push || true
           fi
+      - name: Wait, then schedule the next run (self-chaining)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLEEP_SECONDS: ${{ inputs.sleep_seconds }}
+        run: |
+          sleep "${SLEEP_SECONDS:-600}"
+          me="${{ github.run_id }}"
+          repo="${{ github.repository }}"
+          others=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/actions/runs?per_page=30" | jq --argjson me "$me" '[.workflow_runs[] | select(.name == "BTC move alerts") | select(.status != "completed") | select(.id != $me)] | length')
+          if [ "$others" -gt 0 ] 2>/dev/null; then
+            echo "another run is already pending ($others); not scheduling a new one"
+            exit 0
+          fi
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/actions/workflows/check.yml/dispatches" -d '{"ref":"main"}')
+            echo "schedule-next attempt $i -> $code"
+            if [ "$code" = "204" ]; then break; fi
+            sleep 10
+          done
