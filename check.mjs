@@ -6,6 +6,12 @@ const testMode = process.env.TEST_MODE === "true";
 const dryRun = process.env.DRY_RUN === "true";
 const THRESHOLD = 500;
 const STATE_FILE = "state.json";
+const EMA_SPECS = [
+  { tf: "4h", intervalMin: 240, label: "4h" },
+  { tf: "1d", intervalMin: 1440, label: "daily" },
+  { tf: "1w", intervalMin: 10080, label: "weekly" },
+];
+const EMA_PERIODS = [50, 100, 200];
 
 async function getJson(url) {
   const res = await fetch(url, {
@@ -108,7 +114,11 @@ function readState() {
   try {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     const t = typeof s.anchorTime === "number" ? s.anchorTime : Date.parse(s.anchorTime);
-    return { anchor: Number(s.anchor), anchorTime: Number.isFinite(t) ? t : null };
+    return {
+      anchor: Number(s.anchor),
+      anchorTime: Number.isFinite(t) ? t : 0,
+      signals: s.signals && typeof s.signals === "object" && !Array.isArray(s.signals) ? s.signals : {},
+    };
   } catch {
     return null;
   }
@@ -118,8 +128,91 @@ function writeState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
 
+function emaSeries(closes, period) {
+  const out = new Array(closes.length).fill(null);
+  if (closes.length < period) return out;
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += closes[i];
+  let ema = sum / period;
+  out[period - 1] = ema;
+  const k = 2 / (period + 1);
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+    out[i] = ema;
+  }
+  return out;
+}
+
+function findCross(closed, emas, i) {
+  if (i < 1 || !(emas[i] > 0) || !(emas[i - 1] > 0)) return null;
+  const prevClose = closed[i - 1].close;
+  const lastClose = closed[i].close;
+  if (prevClose <= emas[i - 1] && lastClose > emas[i]) return "up";
+  if (prevClose >= emas[i - 1] && lastClose < emas[i]) return "down";
+  return null;
+}
+
 const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 2 });
 const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+
+async function checkEmas(signals, spot) {
+  let changed = false;
+  for (const spec of EMA_SPECS) {
+    const intervalMs = spec.intervalMin * 60e3;
+    let closed;
+    try {
+      const j = await getJson(`https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=${spec.intervalMin}`);
+      const rows = j.result && (j.result.XXBTZUSD || j.result.XBTUSD);
+      if (!Array.isArray(rows)) throw new Error("unexpected kraken payload");
+      const now = Date.now();
+      closed = rows
+        .map((c) => ({ t: Number(c[0]) * 1000, close: Number(c[4]) }))
+        .filter((c) => c.t + intervalMs <= now + 60000);
+    } catch (err) {
+      console.error(`${spec.tf} ema candles failed: ${err.message}`);
+      continue;
+    }
+    if (closed.length < 3) {
+      console.error(`${spec.tf} ema: not enough closed candles`);
+      continue;
+    }
+    const closes = closed.map((c) => c.close);
+    for (const period of EMA_PERIODS) {
+      const key = `${spec.tf}-${period}`;
+      const emas = emaSeries(closes, period);
+      if (!(emas[closed.length - 1] > 0)) {
+        console.error(`${key}: not enough history for EMA${period}`);
+        continue;
+      }
+
+      if (!(key in signals)) {
+        signals[key] = closed[closed.length - 1].t;
+        changed = true;
+        console.log(`${key}: baseline set (silent)`);
+        continue;
+      }
+
+      let floor = Number(signals[key]) || 0;
+      for (let i = Math.max(1, closed.length - 2); i < closed.length; i++) {
+        const dir = findCross(closed, emas, i);
+        if (dir && closed[i].t > floor) {
+          const closeTime = closed[i].t + intervalMs;
+          const when = spec.tf === "4h"
+            ? `${hhmm(closeTime)} UTC`
+            : `${new Date(closeTime).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+          await sendTelegram(
+            `BTC ${spec.label} closed ${dir === "up" ? "above" : "below"} EMA${period}: $${fmt(closed[i].close)} vs EMA $${fmt(emas[i])} (candle closed ${when}).`
+          );
+          signals[key] = closed[i].t;
+          floor = closed[i].t;
+          changed = true;
+          console.log(`${key}: ${dir}-cross at ${new Date(closed[i].t).toISOString()} (close ${closed[i].close} vs ema ${emas[i].toFixed(2)})`);
+        }
+      }
+    }
+  }
+  return changed;
+}
 
 async function main() {
   if (testMode) {
@@ -131,65 +224,82 @@ async function main() {
   const { price: spot, source: spotSource } = await getSpot();
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
-  const state = readState();
+  const prev = readState();
 
-  if (!state || !(state.anchor > 0) || !(state.anchorTime > 0)) {
-    writeState({ anchor: spot, anchorTime: now });
+  let anchor = prev && prev.anchor > 0 ? prev.anchor : 0;
+  let anchorTime = prev && prev.anchorTime > 0 ? prev.anchorTime : 0;
+  const signals = { ...(prev ? prev.signals : {}) };
+  let changed = false;
+
+  if (!(anchor > 0) || !(anchorTime > 0)) {
+    anchor = spot;
+    anchorTime = now;
+    changed = true;
     console.log(`baseline saved: anchor $${spot} (${spotSource}) at ${nowIso}`);
-    return;
+  } else {
+    try {
+      const path = await fetchPath(anchorTime);
+      const points = path.points.filter((p) => p.t >= anchorTime);
+      let alerts = 0;
+      for (const p of points) {
+        if (alerts >= 20) break;
+        if (p.high >= anchor + THRESHOLD) {
+          const level = anchor + THRESHOLD;
+          const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
+          await sendTelegram(
+            `BTC touched +$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (high $${fmt(p.high)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
+          );
+          anchor = level;
+          anchorTime = p.t + path.intervalMs;
+          alerts++;
+          changed = true;
+          continue;
+        }
+        if (p.low <= anchor - THRESHOLD) {
+          const level = anchor - THRESHOLD;
+          const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
+          await sendTelegram(
+            `BTC touched -$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (low $${fmt(p.low)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
+          );
+          anchor = level;
+          anchorTime = p.t + path.intervalMs;
+          alerts++;
+          changed = true;
+        }
+      }
+      if (alerts > 0) {
+        console.log(`move ALERT x${alerts}, new anchor $${anchor} (${path.source}, ${points.length} points scanned)`);
+      } else {
+        console.log(`ok: no $${THRESHOLD} touch since ${new Date(anchorTime).toISOString()}; spot $${spot} vs anchor $${anchor} (${spotSource}, ${points.length} points scanned)`);
+      }
+    } catch (err) {
+      console.error(`scan failed (${err.message}); falling back to spot check`);
+      const delta = spot - anchor;
+      if (Math.abs(delta) >= THRESHOLD) {
+        const dir = delta > 0 ? "up" : "down";
+        await sendTelegram(
+          `BTC ${dir} $${Math.abs(delta).toFixed(0)} from the last alert price: $${fmt(anchor)} -> $${fmt(spot)} (${spotSource} BTC/USD, ${nowIso}).`
+        );
+        anchor = spot;
+        anchorTime = now;
+        changed = true;
+        console.log(`ALERT (fallback) ${dir} $${delta.toFixed(2)}`);
+      } else {
+        console.log(`ok (fallback): $${spot} vs anchor $${anchor} (delta ${delta.toFixed(2)})`);
+      }
+    }
   }
 
-  let anchor = state.anchor;
-  let anchorTime = state.anchorTime;
-  let alerts = 0;
-
   try {
-    const path = await fetchPath(anchorTime);
-    const points = path.points.filter((p) => p.t >= anchorTime);
-    for (const p of points) {
-      if (alerts >= 20) break;
-      if (p.high >= anchor + THRESHOLD) {
-        const level = anchor + THRESHOLD;
-        const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
-        await sendTelegram(
-          `BTC touched +$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (high $${fmt(p.high)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
-        );
-        anchor = level;
-        anchorTime = p.t + path.intervalMs;
-        alerts++;
-        continue;
-      }
-      if (p.low <= anchor - THRESHOLD) {
-        const level = anchor - THRESHOLD;
-        const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
-        await sendTelegram(
-          `BTC touched -$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (low $${fmt(p.low)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
-        );
-        anchor = level;
-        anchorTime = p.t + path.intervalMs;
-        alerts++;
-      }
-    }
-
-    if (alerts > 0) {
-      writeState({ anchor, anchorTime });
-      console.log(`ALERT x${alerts}, new anchor $${anchor} (${path.source}, ${points.length} points scanned)`);
-    } else {
-      console.log(`ok: no $${THRESHOLD} touch since ${new Date(state.anchorTime).toISOString()}; spot $${spot} vs anchor $${anchor} (${spotSource}, ${points.length} points scanned)`);
-    }
+    const emaChanged = await checkEmas(signals, spot);
+    if (emaChanged) changed = true;
   } catch (err) {
-    console.error(`scan failed (${err.message}); falling back to spot check`);
-    const delta = spot - anchor;
-    if (Math.abs(delta) >= THRESHOLD) {
-      const dir = delta > 0 ? "up" : "down";
-      await sendTelegram(
-        `BTC ${dir} $${Math.abs(delta).toFixed(0)} from the last alert price: $${fmt(anchor)} -> $${fmt(spot)} (${spotSource} BTC/USD, ${nowIso}).`
-      );
-      writeState({ anchor: spot, anchorTime: now });
-      console.log(`ALERT (fallback) ${dir} $${delta.toFixed(2)}`);
-    } else {
-      console.log(`ok (fallback): $${spot} vs anchor $${anchor} (delta ${delta.toFixed(2)})`);
-    }
+    console.error(`ema section failed: ${err.message}`);
+  }
+
+  if (changed) {
+    writeState({ anchor, anchorTime, signals });
+    console.log(`state updated (anchor $${anchor}, ${Object.keys(signals).length} signals tracked)`);
   }
 }
 
