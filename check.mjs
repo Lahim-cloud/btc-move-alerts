@@ -12,6 +12,14 @@ const EMA_SPECS = [
   { tf: "1w", intervalMin: 10080, label: "weekly" },
 ];
 const EMA_PERIODS = [50, 100, 200];
+const LEVELS = (process.env.LEVELS || "85394.91,81844.53,80801.65,80000,79500.79")
+  .split(",")
+  .map((s) => Number(s.trim()))
+  .filter((n) => n > 0);
+const TRENDLINE = { t1: 1790020800000, p1: 87446.7, t2: 1790553600000, p2: 85060.8 };
+const TOUCH_ZONE = 75;
+const REARM_DIST = 400;
+const LINE_SCAN_MS = 45 * 60e3;
 
 async function getJson(url) {
   const res = await fetch(url, {
@@ -118,6 +126,7 @@ function readState() {
       anchor: Number(s.anchor),
       anchorTime: Number.isFinite(t) ? t : 0,
       signals: s.signals && typeof s.signals === "object" && !Array.isArray(s.signals) ? s.signals : {},
+      lines: s.lines && typeof s.lines === "object" && !Array.isArray(s.lines) ? s.lines : {},
     };
   } catch {
     return null;
@@ -154,8 +163,9 @@ function findCross(closed, emas, i) {
 
 const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 2 });
 const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+const lineAt = (t) => TRENDLINE.p1 + ((TRENDLINE.p2 - TRENDLINE.p1) * (t - TRENDLINE.t1)) / (TRENDLINE.t2 - TRENDLINE.t1);
 
-async function checkEmas(signals, spot) {
+async function checkEmas(signals) {
   let changed = false;
   for (const spec of EMA_SPECS) {
     const intervalMs = spec.intervalMin * 60e3;
@@ -214,6 +224,61 @@ async function checkEmas(signals, spot) {
   return changed;
 }
 
+async function checkLines(linesState, spot) {
+  let changed = false;
+  let candles;
+  try {
+    const j = await getJson("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=5");
+    const rows = j.result && (j.result.XXBTZUSD || j.result.XBTUSD);
+    if (!Array.isArray(rows)) throw new Error("unexpected kraken payload");
+    const cutoff = Date.now() - LINE_SCAN_MS;
+    candles = rows
+      .map((c) => ({ t: Number(c[0]) * 1000, high: Number(c[2]), low: Number(c[3]), close: Number(c[4]) }))
+      .filter((c) => c.t >= cutoff);
+    if (!candles.length) throw new Error("no recent candles");
+  } catch (err) {
+    console.error(`lines candles failed: ${err.message}`);
+    return false;
+  }
+
+  const targets = [];
+  for (const level of LEVELS) {
+    targets.push({ key: `level:${level}`, label: `the $${fmt(level)} level`, valueAt: () => level, valueNow: level, isLine: false });
+  }
+  targets.push({ key: "trendline", label: "the downtrend line", valueAt: (t) => lineAt(t), valueNow: lineAt(Date.now()), isLine: true });
+
+  for (const target of targets) {
+    if (!(target.key in linesState)) {
+      linesState[target.key] = { armed: true };
+      changed = true;
+      console.log(`${target.key}: armed`);
+    }
+    const st = linesState[target.key];
+    const dist = Math.abs(spot - target.valueNow);
+    if (!st.armed && dist > REARM_DIST) {
+      st.armed = true;
+      changed = true;
+      console.log(`${target.key}: re-armed (price is $${fmt(dist)} away)`);
+    }
+    if (!st.armed) continue;
+    const hit = candles.find((c) => {
+      const lv = target.valueAt(c.t + 150e3);
+      return c.low <= lv + TOUCH_ZONE && c.high >= lv - TOUCH_ZONE;
+    });
+    if (!hit) continue;
+    const lv = target.valueAt(hit.t + 150e3);
+    const side = hit.close > lv ? " above it" : " below it";
+    const extra = target.isLine ? `; candle closed${side}` : "";
+    await sendTelegram(
+      `BTC touched ${target.label} (~$${fmt(lv)})${extra} (low $${fmt(hit.low)}, high $${fmt(hit.high)}, now $${fmt(spot)}) (Kraken BTC/USD, ${hhmm(hit.t)}-${hhmm(hit.t + 300e3)} UTC).`
+    );
+    st.armed = false;
+    changed = true;
+    console.log(`${target.key}: touched (candle ${hhmm(hit.t)} UTC, target $${lv.toFixed(2)}, close ${hit.close})`);
+  }
+  return changed;
+}
+
 async function main() {
   if (testMode) {
     await sendTelegram("Test from your GitHub-cloud BTC watcher: it is live and will alert you on moves of $500 or more, 24/7. No PC needed.");
@@ -229,6 +294,7 @@ async function main() {
   let anchor = prev && prev.anchor > 0 ? prev.anchor : 0;
   let anchorTime = prev && prev.anchorTime > 0 ? prev.anchorTime : 0;
   const signals = { ...(prev ? prev.signals : {}) };
+  const lines = { ...(prev ? prev.lines : {}) };
   let changed = false;
 
   if (!(anchor > 0) || !(anchorTime > 0)) {
@@ -291,15 +357,22 @@ async function main() {
   }
 
   try {
-    const emaChanged = await checkEmas(signals, spot);
+    const emaChanged = await checkEmas(signals);
     if (emaChanged) changed = true;
   } catch (err) {
     console.error(`ema section failed: ${err.message}`);
   }
 
+  try {
+    const linesChanged = await checkLines(lines, spot);
+    if (linesChanged) changed = true;
+  } catch (err) {
+    console.error(`lines section failed: ${err.message}`);
+  }
+
   if (changed) {
-    writeState({ anchor, anchorTime, signals });
-    console.log(`state updated (anchor $${anchor}, ${Object.keys(signals).length} signals tracked)`);
+    writeState({ anchor, anchorTime, signals, lines });
+    console.log(`state updated (anchor $${anchor}, ${Object.keys(signals).length} signals, ${Object.keys(lines).length} lines tracked)`);
   }
 }
 
