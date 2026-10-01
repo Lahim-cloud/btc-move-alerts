@@ -11,5 +11,25 @@
     "1w-50": 1789603200000,
     "1w-100": 1789603200000,
     "1w-200": 1789603200000
+  },
+  "lines": {
+    "level:85394.91": {
+      "armed": true
+    },
+    "level:81844.53": {
+      "armed": true
+    },
+    "level:80801.65": {
+      "armed": true
+    },
+    "level:80000": {
+      "armed": true
+    },
+    "level:79500.79": {
+      "armed": true
+    },
+    "trendline": {
+      "armed": true
+    }
   }
 }
