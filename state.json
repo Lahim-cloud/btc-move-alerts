@@ -29,7 +29,7 @@
       "armed": true
     },
     "trendline": {
-      "armed": true
+      "armed": false
     }
   }
 }
