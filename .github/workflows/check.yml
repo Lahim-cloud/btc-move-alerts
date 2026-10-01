@@ -11,7 +11,7 @@ on:
         default: false
       sleep_seconds:
         description: "Seconds to wait before scheduling the next run (testing only; leave default in normal use)"
-        default: "600"
+        default: "280"
 
 permissions:
   contents: write
@@ -64,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SLEEP_SECONDS: ${{ inputs.sleep_seconds }}
         run: |
-          sleep "${SLEEP_SECONDS:-600}"
+          sleep "${SLEEP_SECONDS:-280}"
           me="${{ github.run_id }}"
           repo="${{ github.repository }}"
           others=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/actions/runs?per_page=30" | jq --argjson me "$me" '[.workflow_runs[] | select(.name == "BTC move alerts") | select(.status != "completed") | select(.id != $me)] | length')
