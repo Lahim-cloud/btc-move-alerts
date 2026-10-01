@@ -211,7 +211,7 @@ async function checkEmas(signals) {
             ? `${hhmm(closeTime)} UTC`
             : `${new Date(closeTime).toISOString().slice(0, 16).replace("T", " ")} UTC`;
           await sendTelegram(
-            `BTC ${spec.label} closed ${dir === "up" ? "above" : "below"} EMA${period}: $${fmt(closed[i].close)} vs EMA $${fmt(emas[i])} (candle closed ${when}).`
+            `${dir === "up" ? "🟢" : "🔴"} BTC ${spec.label} closed ${dir === "up" ? "above" : "below"} EMA${period}: $${fmt(closed[i].close)} vs EMA $${fmt(emas[i])} (candle closed ${when}).`
           );
           signals[key] = closed[i].t;
           floor = closed[i].t;
@@ -267,10 +267,9 @@ async function checkLines(linesState, spot) {
     });
     if (!hit) continue;
     const lv = target.valueAt(hit.t + 150e3);
-    const side = hit.close > lv ? " above it" : " below it";
-    const extra = target.isLine ? `; candle closed${side}` : "";
+    const above = hit.close > lv;
     await sendTelegram(
-      `BTC touched ${target.label} (~$${fmt(lv)})${extra} (low $${fmt(hit.low)}, high $${fmt(hit.high)}, now $${fmt(spot)}) (Kraken BTC/USD, ${hhmm(hit.t)}-${hhmm(hit.t + 300e3)} UTC).`
+      `${above ? "🟢" : "🔴"} BTC touched ${target.label} (~$${fmt(lv)}); candle closed ${above ? "above" : "below"} it (low $${fmt(hit.low)}, high $${fmt(hit.high)}, now $${fmt(spot)}) (Kraken BTC/USD, ${hhmm(hit.t)}-${hhmm(hit.t + 300e3)} UTC).`
     );
     st.armed = false;
     changed = true;
@@ -313,7 +312,7 @@ async function main() {
           const level = anchor + THRESHOLD;
           const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
           await sendTelegram(
-            `BTC touched +$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (high $${fmt(p.high)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
+            `🟢 BTC touched +$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (high $${fmt(p.high)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
           );
           anchor = level;
           anchorTime = p.t + path.intervalMs;
@@ -325,7 +324,7 @@ async function main() {
           const level = anchor - THRESHOLD;
           const win = `${hhmm(p.t)}-${hhmm(p.t + path.intervalMs)} UTC`;
           await sendTelegram(
-            `BTC touched -$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (low $${fmt(p.low)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
+            `🔴 BTC touched -$${THRESHOLD} from the last alert price: $${fmt(anchor)} -> $${fmt(level)} (low $${fmt(p.low)}, now $${fmt(spot)}) (${path.source} BTC/USD, ${win}).`
           );
           anchor = level;
           anchorTime = p.t + path.intervalMs;
@@ -344,7 +343,7 @@ async function main() {
       if (Math.abs(delta) >= THRESHOLD) {
         const dir = delta > 0 ? "up" : "down";
         await sendTelegram(
-          `BTC ${dir} $${Math.abs(delta).toFixed(0)} from the last alert price: $${fmt(anchor)} -> $${fmt(spot)} (${spotSource} BTC/USD, ${nowIso}).`
+          `${delta > 0 ? "🟢" : "🔴"} BTC ${dir} $${Math.abs(delta).toFixed(0)} from the last alert price: $${fmt(anchor)} -> $${fmt(spot)} (${spotSource} BTC/USD, ${nowIso}).`
         );
         anchor = spot;
         anchorTime = now;
